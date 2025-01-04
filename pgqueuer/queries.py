@@ -408,10 +408,11 @@ class Queries:
         )
 
     async def update_heartbeat(self, job_ids: list[models.JobId]) -> None:
-        await self.driver.execute(
-            self.qbq.create_update_heartbeat_query(),
-            list(set(job_ids)),
-        )
+        if job_ids:
+            await self.driver.execute(
+                self.qbq.create_update_heartbeat_query(),
+                list(set(job_ids)),
+            )
 
     async def insert_schedule(
         self,

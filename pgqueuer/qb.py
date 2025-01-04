@@ -100,6 +100,9 @@ class DBSettings(BaseSettings):
     # Name of the main table where jobs are queued before being processed.
     queue_table: str = Field(default=add_prefix("pgqueuer"))
 
+    # Name of table where jobs are log before after processed.
+    queue_table_log: str = Field(default=add_prefix("pgqueuer_log"))
+
     # Name of the trigger that invokes the function to notify changes, applied
     # after DML operations on the queue table.
     trigger: str = Field(default=add_prefix("tg_pgqueuer_changed"))
@@ -155,6 +158,20 @@ class QueryBuilderEnvironment:
     CREATE INDEX {self.settings.queue_table}_queue_manager_id_idx ON {self.settings.queue_table} (queue_manager_id)
         WHERE queue_manager_id IS NOT NULL;
 
+    CREATE TABLE {self.settings.queue_table_log} (
+        id SERIAL PRIMARY KEY,
+        aggregated BOOLEAN NOT NULL DEFAULT FALSE,
+        job_id BIGINT NOT NULL,
+        priority INT NOT NULL,
+        queue_manager_id UUID,
+        created TIMESTAMP WITH TIME ZONE NOT NULL,
+        execute_after TIMESTAMP WITH TIME ZONE NOT NULL,
+        status TEXT NOT NULL,
+        entrypoint TEXT NOT NULL
+    );
+    CREATE INDEX {self.settings.queue_table_log}_aggregated ON {self.settings.queue_table_log} (aggregated);
+    CREATE INDEX {self.settings.queue_table_log}_job_id ON {self.settings.queue_table_log} (job_id);
+
     CREATE TYPE {self.settings.statistics_table_status_type} AS ENUM ('exception', 'successful', 'canceled');
     CREATE TABLE {self.settings.statistics_table} (
         id SERIAL PRIMARY KEY,
@@ -162,7 +179,7 @@ class QueryBuilderEnvironment:
         count BIGINT NOT NULL,
         priority INT NOT NULL,
         time_in_queue INTERVAL NOT NULL,
-        status {self.settings.statistics_table_status_type} NOT NULL,
+        status TEXT NOT NULL,
         entrypoint TEXT NOT NULL
     );
     CREATE UNIQUE INDEX {self.settings.statistics_table}_unique_count ON {self.settings.statistics_table} (
@@ -474,7 +491,14 @@ class QueryQueueBuilder:
         SET status = 'picked', updated = NOW(), heartbeat = NOW(), queue_manager_id = $6
         WHERE id = ANY(SELECT id FROM combined_jobs)
         RETURNING *
+    ),
+    log_insert AS (
+        INSERT INTO {self.settings.queue_table_log} (
+            job_id, priority, queue_manager_id, created, execute_after, status, entrypoint
     )
+    SELECT id, priority, queue_manager_id, NOW(), execute_after, status::text, entrypoint
+    FROM updated
+)
     SELECT * FROM updated ORDER BY priority DESC, id ASC;
     """  # noqa
 
@@ -490,17 +514,56 @@ class QueryQueueBuilder:
             str: The SQL query string for enqueueing jobs.
         """
 
-        return f"""INSERT INTO {self.settings.queue_table}
-        (priority, entrypoint, payload, execute_after, status)
-        VALUES (
-            UNNEST($1::int[]),                  -- priority
-            UNNEST($2::text[]),                 -- entrypoint
-            UNNEST($3::bytea[]),                -- payload
-            UNNEST($4::interval[]) + NOW(),     -- execute_after
-            'queued'                            -- status
+        return f"""WITH input_data AS (
+            SELECT
+                UNNEST($1::int[]) AS priority,
+                UNNEST($2::text[]) AS entrypoint,
+                UNNEST($3::bytea[]) AS payload,
+                UNNEST($4::interval[]) + NOW() AS execute_after
+        ),
+        inserted_rows AS (
+            INSERT INTO {self.settings.queue_table} (
+                priority,
+                entrypoint,
+                payload,
+                execute_after,
+                status
+            )
+            SELECT
+                priority,
+                entrypoint,
+                payload,
+                execute_after,
+                'queued' AS status
+            FROM input_data
+            RETURNING
+                id,
+                priority,
+                entrypoint,
+                queue_manager_id,
+                NOW() AS created,
+                execute_after
         )
+        INSERT INTO {self.settings.queue_table_log} (
+            job_id,
+            priority,
+            entrypoint,
+            queue_manager_id,
+            created,
+            execute_after,
+            status
+        )
+        SELECT
+            id,
+            priority,
+            entrypoint,
+            queue_manager_id,
+            created,
+            execute_after,
+            'created'
+        FROM inserted_rows
         RETURNING id
-    """
+        """
 
     def create_delete_from_queue_query(self) -> str:
         """
@@ -513,6 +576,7 @@ class QueryQueueBuilder:
         Returns:
             str: The SQL query string for deleting jobs from the queue.
         """
+        # TODO
         return f"DELETE FROM {self.settings.queue_table} WHERE entrypoint = ANY($1)"
 
     def create_truncate_queue_query(self) -> str:
@@ -567,53 +631,52 @@ class QueryQueueBuilder:
         """
 
         return f"""WITH deleted AS (
-        DELETE FROM {self.settings.queue_table}
-        WHERE id = ANY($1::integer[])
-        RETURNING   id,
-                    priority,
-                    entrypoint,
-                    DATE_TRUNC('sec', created at time zone 'UTC') AS created,
-                    DATE_TRUNC('sec', AGE(updated, created)) AS time_in_queue
-    ), job_status AS (
-        SELECT
-            UNNEST($1::integer[]) AS id,
-            UNNEST($2::{self.settings.statistics_table_status_type}[]) AS status
-    ), grouped_data AS (
-        SELECT
+            DELETE FROM {self.settings.queue_table}
+            WHERE id = ANY($1::integer[])
+            RETURNING
+                id AS job_id,
+                priority,
+                entrypoint,
+                created,
+                execute_after,
+                queue_manager_id
+        ),
+        statuses AS (
+            SELECT
+                UNNEST($1::integer[])   AS job_id,
+                UNNEST($2::text[])      AS status
+        ),
+        log_entries AS (
+            SELECT
+                d.job_id,
+                d.priority,
+                d.entrypoint,
+                d.created,
+                d.execute_after,
+                d.queue_manager_id,
+                s.status
+            FROM deleted d
+            JOIN statuses s ON d.job_id = s.job_id
+        )
+        INSERT INTO {self.settings.queue_table_log} (
+            job_id,
             priority,
             entrypoint,
-            time_in_queue,
             created,
+            execute_after,
             status,
-            count(*)
-        FROM deleted JOIN job_status ON job_status.id = deleted.id
-        GROUP BY priority, entrypoint, time_in_queue, created, status
-    )
-    INSERT INTO {self.settings.statistics_table} (
-        priority,
-        entrypoint,
-        time_in_queue,
-        created,
-        status,
-        count
-    ) SELECT
-        priority,
-        entrypoint,
-        time_in_queue,
-        created,
-        status,
-        count
-    FROM grouped_data
-    ON CONFLICT (
-        priority,
-        entrypoint,
-        DATE_TRUNC('sec', created at time zone 'UTC'),
-        DATE_TRUNC('sec', time_in_queue),
-        status
-    )
-    DO UPDATE
-    SET count = {self.settings.statistics_table}.count + EXCLUDED.count
-    """
+            queue_manager_id
+        )
+        SELECT
+            job_id,
+            priority,
+            entrypoint,
+            created,
+            execute_after,
+            status,
+            queue_manager_id
+        FROM log_entries
+        """
 
     def create_truncate_log_query(self) -> str:
         """
@@ -751,3 +814,59 @@ class QuerySchedulerBuilder:
 
     def create_truncate_schedule_query(self) -> str:
         return f"TRUNCATE {self.settings.schedules_table}"
+
+
+@dataclasses.dataclass
+class QueryStatisticsBuilder:
+    """
+    Generates SQL for job scheduler operations.
+
+    Provides SQL queries for managing scheduled jobs, such as inserting,
+    fetching, and updating job schedules.
+
+    Attributes:
+        settings (DBSettings): Database settings instance.
+    """
+
+    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+
+    def create_aggregate_query(self) -> str:
+        return f"""
+        WITH aggregated AS (
+            SELECT
+                COUNT(*),
+                status,
+                priority,
+                entrypoint,
+                DATE_TRUNC('s', created AT TIME ZONE 'UTC') AS created
+            FROM {self.settings.queue_table_log}
+            WHERE NOT aggregated
+            GROUP BY status, priority, entrypoint, DATE_TRUNC('s', created AT TIME ZONE 'UTC')
+        ),
+        inserted AS (
+            INSERT INTO {self.settings.statistics_table} (
+                count,
+                status,
+                priority,
+                entrypoint,
+                created,
+                time_in_queue
+            )
+            SELECT
+                aggregated.count,
+                aggregated.status,
+                aggregated.priority,
+                aggregated.entrypoint,
+                aggregated.created,
+                interval '1 hour'
+            FROM aggregated
+            RETURNING 1
+        ),
+        updated AS (
+            UPDATE pgqueuer_log
+            SET aggregated = TRUE
+            WHERE NOT aggregated
+            RETURNING 1
+        )
+        SELECT 1;
+        """
