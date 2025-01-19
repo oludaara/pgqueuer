@@ -135,11 +135,16 @@ class SchedulerManager:
         Continuously polls for jobs that need to be executed and dispatches them accordingly.
         Also waits for shutdown events and manages the scheduling loop.
         """
-        if not (await self.queries.has_table(self.queries.qbe.settings.schedules_table)):
-            raise RuntimeError(
-                f"The {self.queries.qbe.settings.schedules_table} table is missing "
-                "please run 'pgq upgrade'"
-            )
+
+        for table in (
+            self.queries.qbe.settings.schedules_table,
+            self.queries.qbe.settings.version_table,
+        ):
+            if not (await self.queries.has_table(table)):
+                raise RuntimeError(
+                    f"The required table '{table}' is missing. "
+                    f"Please run 'pgq install' to set up the necessary tables."
+                )
 
         await self.queries.insert_schedule({k: v.next_in() for k, v in self.registry.items()})
 

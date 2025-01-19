@@ -107,6 +107,9 @@ class DBSettings(BaseSettings):
     # Name of scheduler table
     schedules_table: str = Field(default=add_prefix("pgqueuer_schedules"))
 
+    # Name of version table
+    version_table: str = Field(default=add_prefix("pgqueuer_version"))
+
 
 @dataclasses.dataclass
 class QueryBuilderEnvironment:
@@ -134,6 +137,7 @@ class QueryBuilderEnvironment:
         Returns:
             str: A string containing the SQL commands to install the schema.
         """
+        from pgqueuer import __version__
 
         return f"""CREATE TYPE {self.settings.queue_status_type} AS ENUM ('queued', 'picked');
     CREATE TABLE {self.settings.queue_table} (
@@ -185,6 +189,14 @@ class QueryBuilderEnvironment:
         status {self.settings.queue_status_type} DEFAULT 'queued',
         UNIQUE (expression, entrypoint)
     );
+
+    CREATE TABLE {self.settings.version_table} (
+        version TEXT NOT NULL,
+        current BOOLEAN NOT NULL,
+        created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+    );
+    CREATE UNIQUE INDEX {self.settings.version_table}_current ON {self.settings.version_table} ((1)) WHERE current;
+    INSERT INTO {self.settings.version_table}(version, current) VALUES('{__version__}', TRUE);
 
     CREATE FUNCTION {self.settings.function}() RETURNS TRIGGER AS $$
     DECLARE
@@ -248,6 +260,7 @@ class QueryBuilderEnvironment:
     DROP TABLE {self.settings.queue_table};
     DROP TABLE {self.settings.statistics_table};
     DROP TABLE {self.settings.schedules_table};
+    DROP TABLE {self.settings.version_table};
     DROP TYPE {self.settings.queue_status_type};
     DROP TYPE {self.settings.statistics_table_status_type};
     """
@@ -263,6 +276,8 @@ class QueryBuilderEnvironment:
         Yields:
             Generator[str, None, None]: A generator that yields SQL commands.
         """
+        from pgqueuer import __version__
+
         yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS updated TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();"  # noqa: E501
         yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table}_updated_id_id1_idx ON {self.settings.queue_table} (updated ASC, id DESC) INCLUDE (id) WHERE status = 'picked';"  # noqa: E501
         yield f"""CREATE OR REPLACE FUNCTION {self.settings.function}() RETURNS TRIGGER AS $$
@@ -323,6 +338,14 @@ class QueryBuilderEnvironment:
         UNIQUE (expression, entrypoint)
     );"""
         yield f"""ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS execute_after TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();"""  # noqa: E501
+
+        yield f"""CREATE TABLE IF NOT EXISTS {self.settings.version_table} (
+            version TEXT NOT NULL,
+            current BOOLEAN NOT NULL,
+            created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+        );"""
+        yield f"""CREATE UNIQUE INDEX {self.settings.version_table}_current ON {self.settings.version_table} ((1)) WHERE current;"""  # noqa
+        yield f"""INSERT INTO {self.settings.version_table}(version, current) VALUES('{__version__}', TRUE);"""  # noqa
 
     def create_table_has_column_query(self) -> str:
         """
