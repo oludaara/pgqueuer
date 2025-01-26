@@ -750,6 +750,36 @@ class QueryQueueBuilder:
             count = {self.settings.statistics_table}.count + EXCLUDED.count
         """  # noqa
 
+    def build_time_in_queue(self) -> str:
+        return f"""WITH intervals AS (
+            SELECT 
+                job_id                                        AS job_id,
+                entrypoint                                    AS entrypoint,
+                DATE_TRUNC('sec', created at time zone 'UTC') AS bucket,
+                MIN(created) FILTER (WHERE status = 'queued') AS queued_ts,
+                MAX(created) FILTER (WHERE status = 'picked') AS picked_ts  -- Incase of requeue pick latest
+            FROM {self.settings.queue_table_log}
+            WHERE 
+                    status = 'queued' OR status = 'picked'
+                AND ($1::INTERVAL IS NULL OR created + $1 > NOW())
+            GROUP BY job_id, entrypoint, DATE_TRUNC('sec', created at time zone 'UTC')
+            HAVING 
+                    MIN(created) FILTER (WHERE status = 'queued') IS NOT NULL
+                AND MIN(created) FILTER (WHERE status = 'picked') IS NOT NULL)
+            SELECT 
+                entrypoint                                                          AS entrypoint,
+                bucket                                                              AS bucket,
+                COUNT(picked_ts)                                                    AS count,
+                MIN(picked_ts - queued_ts)                                          AS min,
+                MAX(picked_ts - queued_ts)                                          AS max,
+                AVG(picked_ts - queued_ts)                                          AS mean,
+                percentile_cont(0.5)  WITHIN GROUP (ORDER BY picked_ts - queued_ts) AS p50,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY picked_ts - queued_ts) AS p95,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY picked_ts - queued_ts) AS p99
+            FROM intervals
+            GROUP BY entrypoint, bucket;
+            """  # noqa
+
 
 @dataclasses.dataclass
 class QuerySchedulerBuilder:

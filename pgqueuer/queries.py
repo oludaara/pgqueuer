@@ -499,3 +499,13 @@ class Queries:
             models.Log.model_validate(x)
             for x in await self.driver.fetch(self.qbq.build_fetch_log_query())
         ]
+
+    async def time_in_queue_stats(
+        self,
+        newer_then: timedelta | None = timedelta(seconds=60),
+    ) -> list[models.TimeInQueueStats]:
+        newer_then = None
+        return [
+            models.TimeInQueueStats.model_validate(dict(x))
+            for x in await self.driver.fetch(self.qbq.build_time_in_queue(), newer_then)
+        ]

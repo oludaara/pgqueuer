@@ -201,3 +201,15 @@ class Schedule(BaseModel):
     last_run: AwareDatetime | None = None
     status: JOB_STATUS
     entrypoint: CronEntrypoint
+
+
+class TimeInQueueStats(BaseModel):
+    entrypoint: str
+    bucket: datetime
+    count: int
+    min: timedelta | None
+    max: timedelta | None
+    mean: timedelta | None
+    p50: timedelta | None
+    p95: timedelta | None
+    p99: timedelta | None
