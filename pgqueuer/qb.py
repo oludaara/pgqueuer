@@ -813,7 +813,13 @@ class QueryQueueBuilder:
         return f"DELETE FROM {self.settings.queue_table_log} WHERE entrypoint = ANY($1)"
 
     def build_fetch_log_query(self) -> str:
-        return f"SELECT * FROM {self.settings.queue_table_log}"
+        return f"""
+            SELECT * FROM {self.settings.queue_table_log}
+            WHERE
+                    ($1::bigint[]   IS NULL OR job_id = ANY($1))
+                AND ($2::text[]     IS NULL OR entrypoint = ANY($2))
+            ORDER BY job_id, id
+        """
 
     def build_aggregate_log_data_to_statistics_query(self) -> str:
         """

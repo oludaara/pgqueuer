@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import uuid
+from contextlib import suppress
 from datetime import timedelta
-from typing import overload
+from typing import Callable, overload
 
-from . import db, helpers, models, qb
+from . import db, helpers, listeners, models, qb
 
 
 @dataclasses.dataclass
@@ -254,6 +255,46 @@ class Queries:
                 normed_execute_after,
             )
         ]
+
+    async def wait_until(
+        self,
+        job_ids: list[models.JobId],
+        predicate: Callable[[list[models.Log]], bool],
+        pool_interval: timedelta = timedelta(seconds=5),
+    ) -> None:
+        """
+        Wait until a condition is met for the given job IDs using PGNoticeEventListener.
+
+        Args:
+            job_ids (list[JobId]): List of job IDs to monitor.
+            predicate (Callable[[[models.Log]], bool]): Function that takes a job row
+            and returns True when done.
+        """
+        notice_event_listener = listeners.PGNoticeEventListener()
+
+        def handle_event_type(event: models.AnyEvent) -> None:
+            if event.root.type == "table_changed_event":
+                assert isinstance(event, models.TableChangedEvent)
+                notice_event_listener.put_nowait(event)
+
+        async def _wait_for() -> None:
+            await listeners.initialize_notice_event_listener(
+                self.driver,
+                self.qbs.settings.channel,
+                handle_event_type,
+            )
+
+            while True:
+                if predicate(await self.queue_log(job_ids)):
+                    return
+
+                with suppress(TimeoutError, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        notice_event_listener.get(),
+                        timeout=pool_interval.total_seconds(),
+                    )
+
+        await _wait_for()
 
     async def clear_queue(self, entrypoint: str | list[str] | None = None) -> None:
         """
@@ -505,8 +546,16 @@ class Queries:
             self.qbs.build_truncate_schedule_query(),
         )
 
-    async def queue_log(self) -> list[models.Log]:
+    async def queue_log(
+        self,
+        job_ids: list[models.JobId] | None = None,
+        entrypoints: list[str] | None = None,
+    ) -> list[models.Log]:
         return [
             models.Log.model_validate(x)
-            for x in await self.driver.fetch(self.qbq.build_fetch_log_query())
+            for x in await self.driver.fetch(
+                self.qbq.build_fetch_log_query(),
+                job_ids,
+                entrypoints,
+            )
         ]

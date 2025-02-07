@@ -358,6 +358,8 @@ def listen(
         "--channel",
     ),
 ) -> None:
+    logconfig.setup_fancy_logger(logconfig.LogLevel.INFO)
+
     async def run() -> None:
         async with yield_queries(ctx, qb.DBSettings()) as q:
             await display_pg_channel(q.driver, models.Channel(channel))
